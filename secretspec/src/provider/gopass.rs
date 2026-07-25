@@ -230,6 +230,29 @@ impl Provider for GoPassProvider {
         Ok(())
     }
 
+    fn delete(&self, addr: Address<'_>) -> crate::Result<()> {
+        let entry_name = super::flat_item(self, addr)?;
+        let output = self
+            .command()
+            .args(["rm", "-f", &entry_name])
+            .output()
+            .map_err(|error| {
+                SecretSpecError::ProviderOperationFailed(format!(
+                    "Failed to execute 'gopass' command: {error}. Is gopass installed?"
+                ))
+            })?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if output.status.code() == Some(11) && stderr.contains("is not in the password store") {
+            return Ok(());
+        }
+        Err(SecretSpecError::ProviderOperationFailed(format!(
+            "gopass command failed: {stderr}"
+        )))
+    }
+
     fn name(&self) -> &'static str {
         Self::PROVIDER_NAME
     }

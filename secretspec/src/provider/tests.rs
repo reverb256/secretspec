@@ -49,6 +49,12 @@ impl Provider for MockProvider {
         Ok(())
     }
 
+    fn delete(&self, addr: Address<'_>) -> Result<()> {
+        let item = super::flat_item(self, addr)?.into_owned();
+        MEM_STORE.lock().unwrap().remove(&item);
+        Ok(())
+    }
+
     fn name(&self) -> &'static str {
         "mock"
     }

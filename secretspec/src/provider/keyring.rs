@@ -181,6 +181,15 @@ impl Provider for KeyringProvider {
         entry.set_password(value.expose_secret())?;
         Ok(())
     }
+
+    fn delete(&self, addr: Address<'_>) -> Result<()> {
+        let (service, username) = self.entry_target(addr)?;
+        let entry = Entry::new(&service, &username)?;
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
 }
 
 #[cfg(test)]

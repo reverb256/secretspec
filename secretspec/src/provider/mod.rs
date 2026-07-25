@@ -621,6 +621,20 @@ pub trait Provider: Send + Sync {
     /// [`check_writable`](Provider::check_writable) does, for the same address.
     fn set(&self, addr: Address<'_>, value: &SecretString) -> Result<()>;
 
+    /// Deletes a secret at `addr`. Available since SecretSpec 0.17.
+    ///
+    /// Providers opt into deletion explicitly. This is used by cache
+    /// invalidation and defaults to a clear unsupported-operation error so
+    /// adding the method does not silently make destructive behavior available
+    /// to every provider.
+    fn delete(&self, addr: Address<'_>) -> Result<()> {
+        let _ = addr;
+        Err(SecretSpecError::ProviderOperationFailed(format!(
+            "provider '{}' does not support deleting secrets",
+            self.name()
+        )))
+    }
+
     /// Reports whether this provider can write to `addr`, and why not when it
     /// cannot.
     ///
@@ -835,6 +849,9 @@ impl<T: Provider> Provider for std::sync::Arc<T> {
     fn set(&self, addr: Address<'_>, value: &SecretString) -> Result<()> {
         (**self).set(addr, value)
     }
+    fn delete(&self, addr: Address<'_>) -> Result<()> {
+        (**self).delete(addr)
+    }
     fn check_writable(&self, addr: Address<'_>) -> Result<()> {
         (**self).check_writable(addr)
     }
@@ -989,6 +1006,11 @@ impl Provider for PreflightGuard {
     fn set(&self, addr: Address<'_>, value: &SecretString) -> Result<()> {
         self.check()?;
         self.inner.set(addr, value)
+    }
+
+    fn delete(&self, addr: Address<'_>) -> Result<()> {
+        self.check()?;
+        self.inner.delete(addr)
     }
 
     fn check_writable(&self, addr: Address<'_>) -> Result<()> {

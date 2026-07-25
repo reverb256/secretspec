@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Cached provider aliases with ordered authoritative `fallback` routes,
+  configurable local cache freshness, cache-first reads, automatic refresh
+  after reads and writes, and `secretspec cache clear` invalidation.
+  ([#199](https://github.com/cachix/secretspec/issues/199))
 - `secretspec config global init --provider <PROVIDER> --profile <PROFILE>`
   can save explicitly user-global defaults without interactive prompts,
   including `--profile none` to clear the default profile. The `global`

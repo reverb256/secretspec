@@ -341,6 +341,22 @@ impl Provider for DotEnvProvider {
         Ok(())
     }
 
+    fn delete(&self, addr: Address<'_>) -> Result<()> {
+        let target = super::flat_item(self, addr)?;
+        validate_env_key(&target)?;
+        if !self.config.path.exists() {
+            return Ok(());
+        }
+        let mut vars = HashMap::new();
+        for item in dotenvy::from_path_iter(&self.config.path)? {
+            let (key, value) = item?;
+            vars.insert(key, value);
+        }
+        vars.remove(target.as_ref());
+        fs::write(&self.config.path, serialize_dotenv(&vars))?;
+        Ok(())
+    }
+
     fn reflect(&self) -> Result<HashMap<String, crate::config::Secret>> {
         use crate::config::Secret;
 

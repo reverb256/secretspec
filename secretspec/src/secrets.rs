@@ -21,6 +21,7 @@ use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Format the human-facing name and optional description used by status output.
 ///
@@ -88,6 +89,54 @@ fn sorted_credential_entries(
     let mut entries: Vec<(&String, &CredentialSource)> = credentials.iter().collect();
     entries.sort_by_key(|(name, _)| name.as_str());
     entries
+}
+
+const CACHE_ENVELOPE_VERSION: u8 = 1;
+
+/// Value stored inside the configured cache provider. The provider remains
+/// responsible for encryption; the envelope adds freshness and route
+/// invalidation metadata.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CacheEnvelope {
+    v: u8,
+    cached_at: u64,
+    route_fingerprint: String,
+    value: String,
+}
+
+fn cache_warning(secret_name: &str, message: impl std::fmt::Display) {
+    eprintln!(
+        "{} cache failed for {}: {}; consulting authoritative providers",
+        "warning:".yellow(),
+        secret_name.bold(),
+        message
+    );
+}
+
+/// Include the secret's logical identity and native coordinates in the route
+/// fingerprint. The logical cache address intentionally stays
+/// `{project}/{profile}/{name}` even when the authoritative provider uses a
+/// native `ref`.
+fn secret_cache_fingerprint(planned: &PlannedSecret, route: &Route) -> String {
+    let cache = route
+        .cache()
+        .expect("cache fingerprint requires a cached route");
+    let address = planned
+        .reference()
+        .map(NativeAddress::render)
+        .unwrap_or_else(|| "convention".to_string());
+    let mut hash = 0xcbf29ce484222325_u64;
+    for part in [
+        cache.route_fingerprint.as_str(),
+        planned.name.as_str(),
+        address.as_str(),
+    ] {
+        for byte in part.len().to_le_bytes().iter().chain(part.as_bytes()) {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    format!("v1-{hash:016x}")
 }
 
 /// Convention-path profile segment for provider credentials. A provider's
@@ -718,6 +767,15 @@ impl Secrets {
         spec: &str,
         credentials: ProviderCredentials,
     ) -> Result<Box<dyn ProviderTrait>> {
+        if self
+            .lookup_provider_alias_entry(spec)
+            .is_some_and(ProviderAlias::is_cached)
+        {
+            return Err(SecretSpecError::ProviderOperationFailed(format!(
+                "cached provider alias '{spec}' is a complete route; select it through a \
+                 secret's providers list, the default provider, or --provider"
+            )));
+        }
         // Resolve provider aliases here, at the single construction chokepoint, so
         // every caller that hands us a user-supplied spec gets alias expansion for
         // free and no new entry point can forget it. Resolution is a no-op on an
@@ -1250,7 +1308,7 @@ impl Secrets {
     /// Resolves a provider alias to its full entry (URI plus any provider
     /// credentials), walking [`Self::provider_alias_sources`] in order. Project
     /// entries win over user-global ones.
-    fn lookup_provider_alias_entry(&self, alias: &str) -> Option<&ProviderAlias> {
+    pub(crate) fn lookup_provider_alias_entry(&self, alias: &str) -> Option<&ProviderAlias> {
         self.provider_alias_sources().find_map(|m| m.get(alias))
     }
 
@@ -1258,6 +1316,7 @@ impl Secrets {
     /// [`Self::provider_alias_sources`] in order.
     fn lookup_provider_alias(&self, alias: &str) -> Option<String> {
         self.lookup_provider_alias_entry(alias)
+            .filter(|alias| !alias.is_cached())
             .map(|alias| alias.uri.clone())
     }
 
@@ -1296,6 +1355,15 @@ impl Secrets {
     pub(crate) fn resolve_one_provider(&self, spec: &str) -> Result<String> {
         if spec.contains("://") {
             return Ok(spec.to_string());
+        }
+        if self
+            .lookup_provider_alias_entry(spec)
+            .is_some_and(ProviderAlias::is_cached)
+        {
+            return Err(SecretSpecError::ProviderOperationFailed(format!(
+                "cached provider alias '{spec}' is a complete route and cannot be used where a \
+                 leaf provider is required"
+            )));
         }
         if let Some(uri) = self.lookup_provider_alias(spec) {
             return Ok(uri);
@@ -1353,6 +1421,119 @@ impl Secrets {
             .map(|planned| (planned.name.as_str(), planned.as_address(project, profile)))
             .collect();
         provider.get_many(&requests)
+    }
+
+    /// Read and validate one cached envelope. Every cache failure is fail-open:
+    /// the authoritative route remains usable and gets a chance to refresh the
+    /// cache after a successful read.
+    fn read_cached_secret(
+        &self,
+        planned: &PlannedSecret,
+        route: &Route,
+        profile: &str,
+    ) -> Option<(SecretString, String)> {
+        let cache = route.cache()?;
+        let provider = match self.build_provider(cache.spec.clone(), Some(profile)) {
+            Ok(provider) => provider,
+            Err(error) => {
+                cache_warning(&planned.name, error);
+                return None;
+            }
+        };
+        let address = Address::convention(&self.config.project.name, profile, &planned.name);
+        let stored = match provider.get(address) {
+            Ok(Some(value)) => value,
+            Ok(None) => return None,
+            Err(error) => {
+                cache_warning(&planned.name, error);
+                return None;
+            }
+        };
+        let envelope: CacheEnvelope = match serde_json::from_str(stored.expose_secret()) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                cache_warning(&planned.name, format!("invalid cache entry: {error}"));
+                return None;
+            }
+        };
+        if envelope.v != CACHE_ENVELOPE_VERSION {
+            cache_warning(
+                &planned.name,
+                format!("unsupported cache entry version {}", envelope.v),
+            );
+            return None;
+        }
+        if envelope.route_fingerprint != secret_cache_fingerprint(planned, route) {
+            return None;
+        }
+        let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(duration) => duration.as_secs(),
+            Err(error) => {
+                cache_warning(&planned.name, error);
+                return None;
+            }
+        };
+        if envelope.cached_at > now || now.saturating_sub(envelope.cached_at) > cache.max_age_secs {
+            return None;
+        }
+        Some((SecretString::new(envelope.value.into()), provider.uri()))
+    }
+
+    /// Refresh a cached route after its authoritative provider returns or
+    /// accepts a value. Cache writes are best-effort: losing the acceleration
+    /// layer must never turn a successful authoritative operation into failure.
+    fn write_cached_secret(
+        &self,
+        planned: &PlannedSecret,
+        route: &Route,
+        profile: &str,
+        value: &SecretString,
+    ) {
+        let Some(cache) = route.cache() else {
+            return;
+        };
+        let provider = match self.build_provider(cache.spec.clone(), Some(profile)) {
+            Ok(provider) => provider,
+            Err(error) => {
+                cache_warning(&planned.name, error);
+                return;
+            }
+        };
+        let cached_at = match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(duration) => duration.as_secs(),
+            Err(error) => {
+                cache_warning(&planned.name, error);
+                return;
+            }
+        };
+        let envelope = CacheEnvelope {
+            v: CACHE_ENVELOPE_VERSION,
+            cached_at,
+            route_fingerprint: secret_cache_fingerprint(planned, route),
+            value: value.expose_secret().to_string(),
+        };
+        let serialized = match serde_json::to_string(&envelope) {
+            Ok(serialized) => SecretString::new(serialized.into()),
+            Err(error) => {
+                cache_warning(&planned.name, error);
+                return;
+            }
+        };
+        let address = Address::convention(&self.config.project.name, profile, &planned.name);
+        let result = provider
+            .check_writable(address)
+            .and_then(|()| provider.set(address, &serialized));
+        self.audit_write_result(
+            &result,
+            &planned.name,
+            profile,
+            Some(provider.uri()),
+            None,
+            Some("cache"),
+        );
+        if let Err(error) = result {
+            cache_warning(&planned.name, error);
+        }
     }
 
     /// Builds the provider a write goes to for a resolved [`Route`]: the primary
@@ -1414,12 +1595,17 @@ impl Secrets {
     /// could fail or do I/O).
     fn default_provider_spec(&self, provider_arg: Option<&str>) -> Result<String> {
         self.explicit_provider_spec(provider_arg)
-            .or_else(|| {
-                self.global_config
-                    .as_ref()
-                    .and_then(|gc| gc.defaults.provider.clone())
-            })
+            .or_else(|| self.configured_default_provider_spec())
             .ok_or(SecretSpecError::NoProviderConfigured)
+    }
+
+    /// User-global default provider spec, without applying explicit overrides.
+    /// Planning uses this only when it names a cached alias; ordinary defaults
+    /// retain the existing lazy `Route { primary: None }` representation.
+    pub(crate) fn configured_default_provider_spec(&self) -> Option<String> {
+        self.global_config
+            .as_ref()
+            .and_then(|config| config.defaults.provider.clone())
     }
 
     /// Returns a provider URI for validation result metadata without forcing a
@@ -1564,6 +1750,78 @@ impl Secrets {
         }
     }
 
+    /// Delete cached values for the active profile. Available since SecretSpec
+    /// 0.17.
+    ///
+    /// When `name` is `None`, every declared secret using a cached route is
+    /// cleared. A named secret must exist and use a cached route.
+    pub fn clear_cache(&self, name: Option<&str>) -> Result<usize> {
+        self.ensure_reason_for(AuditAction::CacheClear, name)?;
+        let profile = self.resolve_profile_name(None);
+        self.require_profile(&profile)?;
+        let named = name.is_some();
+        let names = match name {
+            Some(name) => vec![name.to_string()],
+            None => self.resolve_profile_secret_names(Some(&profile))?,
+        };
+        let mut cleared = 0;
+
+        for name in names {
+            let planned = match self.plan_secret(&name, &profile, None)? {
+                Some(planned) => planned,
+                None => {
+                    return Err(SecretSpecError::SecretNotFound(format!(
+                        "Secret '{name}' is not defined in profile '{profile}'"
+                    )));
+                }
+            };
+            let Some(route) = &planned.route else {
+                if named {
+                    return Err(SecretSpecError::ProviderOperationFailed(format!(
+                        "secret '{name}' is composed and has no provider cache"
+                    )));
+                }
+                continue;
+            };
+            let Some(cache) = route.cache() else {
+                if named {
+                    return Err(SecretSpecError::ProviderOperationFailed(format!(
+                        "secret '{name}' does not use a cached provider route"
+                    )));
+                }
+                continue;
+            };
+            let provider = self.build_provider(cache.spec.clone(), Some(&profile))?;
+            let address = Address::convention(&self.config.project.name, &profile, &name);
+            let result = provider.delete(address);
+            match &result {
+                Ok(()) => self.record(
+                    AuditAction::CacheClear,
+                    &profile,
+                    AuditOutcome::Deleted,
+                    AuditFields {
+                        key: Some(&name),
+                        provider_uri: Some(provider.uri()),
+                        command: Some("cache"),
+                        ..Default::default()
+                    },
+                ),
+                Err(error) => self.record_key_error(
+                    AuditAction::CacheClear,
+                    &profile,
+                    &name,
+                    Some(provider.uri()),
+                    None,
+                    error,
+                ),
+            }
+            result?;
+            cleared += 1;
+        }
+
+        Ok(cleared)
+    }
+
     /// Sets a secret value in the provider
     ///
     /// If no value is provided, the user will be prompted to enter it securely.
@@ -1700,6 +1958,7 @@ impl Secrets {
             None,
         );
         result?;
+        self.write_cached_secret(&planned, route, &profile_name, &value);
 
         eprintln!(
             "{} Secret '{}' saved to {} (profile: {})",
@@ -1799,23 +2058,37 @@ impl Secrets {
         let default = planned.config().default.clone();
         let as_path = planned.as_path();
 
-        // Walk the route's chain in order; each entry is resolved lazily and a
-        // broken link is skipped with a warning, so an undefined alias never
-        // blocks a provider elsewhere in the chain from answering.
-        let read_specs = route.specs();
-        let result = self.get_secret_from_providers(
-            name,
-            planned.as_address(&self.config.project.name, &profile_name),
-            read_specs.as_deref(),
-            Some(&profile_name),
-        );
+        // A fresh cache hit completes the read without constructing or
+        // contacting any authoritative provider. Misses and invalid entries
+        // fall through to the ordinary ordered provider route.
+        let mut cache_hit = false;
+        let result =
+            if let Some((value, uri)) = self.read_cached_secret(&planned, route, &profile_name) {
+                cache_hit = true;
+                Ok((Some(value), Some(uri)))
+            } else {
+                // Walk the route's chain in order; each entry is resolved lazily and a
+                // broken link is skipped with a warning, so an undefined alias never
+                // blocks a provider elsewhere in the chain from answering.
+                let read_specs = route.specs();
+                let result = self.get_secret_from_providers(
+                    name,
+                    planned.as_address(&self.config.project.name, &profile_name),
+                    read_specs.as_deref(),
+                    Some(&profile_name),
+                );
+                if let Ok((Some(value), _)) = &result {
+                    self.write_cached_secret(&planned, route, &profile_name, value);
+                }
+                result
+            };
 
         // Audit the access at the provider boundary, before defaults are applied.
         // The provider URI consulted is reported back so the chain miss/error
         // attributes to the last provider tried rather than guessing. The native
         // coordinates (if any) are recorded alongside, since the provider URI
         // names only the store.
-        let reference = planned.reference();
+        let reference = (!cache_hit).then(|| planned.reference()).flatten();
         match &result {
             Ok((Some(_), uri)) => self.record(
                 AuditAction::Get,
@@ -2001,18 +2274,17 @@ impl Secrets {
                                 format!("[{}/{}] Enter value for {}:", i + 1, total, secret_name,);
                             let prompt = inquire::Password::new(&prompt_msg).without_confirmation();
 
-                            let value = prompt.prompt()?;
+                            let value = SecretString::new(prompt.prompt()?.into());
 
-                            let backend = self.write_provider_for_route(
-                                planned
-                                    .route
-                                    .as_ref()
-                                    .expect("prompted names are provider-backed leaves"),
-                                Some(&profile_display),
-                            )?;
+                            let route = planned
+                                .route
+                                .as_ref()
+                                .expect("prompted names are provider-backed leaves");
+                            let backend =
+                                self.write_provider_for_route(route, Some(&profile_display))?;
                             let set_result = backend.set(
                                 planned.as_address(&self.config.project.name, &profile_display),
-                                &SecretString::new(value.into()),
+                                &value,
                             );
                             self.audit_write_result(
                                 &set_result,
@@ -2023,6 +2295,7 @@ impl Secrets {
                                 None,
                             );
                             set_result?;
+                            self.write_cached_secret(&planned, route, &profile_display, &value);
                             eprintln!(
                                 "{} Secret '{}' saved to {} (profile: {})",
                                 "✓".green(),
@@ -2312,6 +2585,7 @@ impl Secrets {
                                     None,
                                 );
                                 set_result?;
+                                self.write_cached_secret(&planned, route, &profile_display, &value);
                                 eprintln!(
                                     "{} {} (→ {})",
                                     "✓".green(),
@@ -2467,6 +2741,15 @@ impl Secrets {
             None,
         );
         set_result?;
+        self.write_cached_secret(
+            planned,
+            planned
+                .route
+                .as_ref()
+                .expect("a generating secret is provider-backed"),
+            profile_name,
+            &value,
+        );
 
         eprintln!(
             "{} {} - generated and saved to {} (profile: {})",
@@ -2952,6 +3235,21 @@ impl Secrets {
         // being reported as missing.
         let mut fetched_values: HashMap<String, SecretString> = HashMap::new();
         let mut failed_primary_uris: HashMap<Option<&str>, SecretSpecError> = HashMap::new();
+        let mut cached_uris: HashMap<String, String> = HashMap::new();
+
+        // Consult caches before constructing source providers. Cache hits are
+        // inserted into the same fetched-values map, and their names are
+        // filtered out of source groups below. This ordering is what makes a
+        // cached route useful when its remote provider is slow or unavailable.
+        for planned in &plan.secrets {
+            let Some(route) = &planned.route else {
+                continue;
+            };
+            if let Some((value, uri)) = self.read_cached_secret(planned, route, profile) {
+                cached_uris.insert(planned.name.clone(), uri);
+                fetched_values.insert(planned.name.clone(), value);
+            }
+        }
 
         // Construction stays on this thread: the up-front single-store `ref`
         // check below must see every built provider before any store is
@@ -2960,6 +3258,13 @@ impl Secrets {
         // fetches run concurrently below.
         let mut group_fetches: Vec<GroupFetch<'_>> = Vec::new();
         for (provider_uri, group) in plan.groups() {
+            let group: Vec<&PlannedSecret> = group
+                .into_iter()
+                .filter(|planned| !cached_uris.contains_key(&planned.name))
+                .collect();
+            if group.is_empty() {
+                continue;
+            }
             match self.get_provider(provider_uri, Some(&plan.profile)) {
                 Ok(provider) => {
                     // Attribute primary hits to the provider's own credential-free
@@ -3053,7 +3358,13 @@ impl Secrets {
 
             match fetched_values.remove(name.as_str()) {
                 Some(value) => {
-                    source_provider = group_uris.get(&primary_uri).cloned();
+                    let was_cached = cached_uris.contains_key(name);
+                    source_provider = cached_uris
+                        .remove(name)
+                        .or_else(|| group_uris.get(&primary_uri).cloned());
+                    if !was_cached && materialize == Materialize::Values {
+                        self.write_cached_secret(planned, route, profile, &value);
+                    }
                     // Copy the value into the response only on a full pass; a
                     // value-free pass has the status it needs and never
                     // materializes a value or writes a temp file.
@@ -3110,6 +3421,7 @@ impl Secrets {
                     if let Some(value) = fallback_value {
                         source_provider = fallback_uri;
                         if materialize == Materialize::Values {
+                            self.write_cached_secret(planned, route, profile, &value);
                             self.insert_resolved(
                                 &mut secrets,
                                 &mut temp_files,
@@ -4027,6 +4339,7 @@ mod provider_credential_scope_tests {
                     "access_token".to_string(),
                     CredentialSource::from("memtest://"),
                 )]),
+                ..Default::default()
             },
         )]);
 

@@ -278,6 +278,29 @@ impl Provider for PassProvider {
 
         Ok(())
     }
+
+    fn delete(&self, addr: Address<'_>) -> Result<()> {
+        let entry_name = super::flat_item(self, addr)?;
+        let output = self
+            .command()
+            .args(["rm", "-f", &entry_name])
+            .output()
+            .map_err(|error| {
+                SecretSpecError::ProviderOperationFailed(format!(
+                    "Failed to execute 'pass' command: {error}. Is pass installed?"
+                ))
+            })?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if output.status.code() == Some(1) && stderr.contains("is not in the password store") {
+            return Ok(());
+        }
+        Err(SecretSpecError::ProviderOperationFailed(format!(
+            "pass command failed: {stderr}"
+        )))
+    }
 }
 
 #[cfg(test)]

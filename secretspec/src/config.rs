@@ -148,7 +148,76 @@ impl<'de> Deserialize<'de> for CredentialSource {
     }
 }
 
-/// A provider alias: a provider URI plus an optional credential-source map.
+/// Cache policy for a cached provider alias. Available since SecretSpec 0.17.
+///
+/// Cached aliases read from `provider` before consulting their `fallback`
+/// sources. A cached value remains fresh for `max_age`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderCache {
+    /// Leaf provider spec used to persist the cache envelope.
+    pub provider: String,
+    /// Human-readable freshness duration (`30m`, `8h`, `1d`, or combinations).
+    pub max_age: String,
+}
+
+/// Parse a cache duration without accepting ambiguous bare numbers.
+pub(crate) fn parse_cache_max_age(value: &str) -> std::result::Result<u64, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("cache max_age must not be empty".to_string());
+    }
+
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    let mut total = 0_u64;
+    while index < bytes.len() {
+        let digits_start = index;
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+        if digits_start == index {
+            return Err(format!(
+                "invalid cache max_age '{value}'; expected a duration such as '30m', '8h', or '1d'"
+            ));
+        }
+        let amount: u64 = value[digits_start..index]
+            .parse()
+            .map_err(|_| format!("cache max_age '{value}' is too large"))?;
+        if index == bytes.len() {
+            return Err(format!(
+                "invalid cache max_age '{value}'; every number needs a unit (s, m, h, d, or w)"
+            ));
+        }
+        let multiplier = match bytes[index] {
+            b's' => 1,
+            b'm' => 60,
+            b'h' => 60 * 60,
+            b'd' => 24 * 60 * 60,
+            b'w' => 7 * 24 * 60 * 60,
+            _ => {
+                return Err(format!(
+                    "invalid cache max_age '{value}'; supported units are s, m, h, d, and w"
+                ));
+            }
+        };
+        index += 1;
+        total = total
+            .checked_add(
+                amount
+                    .checked_mul(multiplier)
+                    .ok_or_else(|| format!("cache max_age '{value}' is too large"))?,
+            )
+            .ok_or_else(|| format!("cache max_age '{value}' is too large"))?;
+    }
+    if total == 0 {
+        return Err("cache max_age must be greater than zero".to_string());
+    }
+    Ok(total)
+}
+
+/// A provider alias: either a leaf provider or, in SecretSpec 0.17+, a cached
+/// fallback route.
 ///
 /// In TOML an alias is written either as a bare string, which is just the URI:
 ///
@@ -165,7 +234,17 @@ impl<'de> Deserialize<'de> for CredentialSource {
 /// bws = { uri = "bws://project-uuid", credentials = { access_token = "keyring" } }
 /// ```
 ///
-/// The two forms round-trip losslessly: an alias with no credentials serializes
+/// A cached route names its authoritative sources in fallback order and a leaf
+/// provider used for the local cache:
+///
+/// ```toml
+/// [providers]
+/// azure = "akv://team-vault"
+/// local = "keyring://secretspec/cache/{project}/{profile}/{key}"
+/// myprovider = { fallback = ["azure", "env"], cache = { provider = "local", max_age = "8h" } }
+/// ```
+///
+/// Leaf aliases round-trip as before: an alias with no credentials serializes
 /// back to a bare string, so existing configs are untouched.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ProviderAlias {
@@ -175,6 +254,11 @@ pub struct ProviderAlias {
     /// Empty for a bare string alias, so "declares no credentials" has exactly
     /// one representation.
     pub credentials: HashMap<String, CredentialSource>,
+    /// Ordered authoritative sources for a cached alias (0.17+). Empty for a
+    /// leaf alias.
+    pub fallback: Vec<String>,
+    /// Cache policy for a cached alias (0.17+). `None` for a leaf alias.
+    pub cache: Option<ProviderCache>,
 }
 
 impl ProviderAlias {
@@ -183,7 +267,15 @@ impl ProviderAlias {
         Self {
             uri: uri.into(),
             credentials: HashMap::new(),
+            fallback: Vec::new(),
+            cache: None,
         }
+    }
+
+    /// Whether this alias describes a cached route rather than a leaf provider
+    /// (0.17+).
+    pub fn is_cached(&self) -> bool {
+        self.cache.is_some()
     }
 }
 
@@ -201,6 +293,15 @@ impl From<&str> for ProviderAlias {
 
 impl std::fmt::Display for ProviderAlias {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(cache) = &self.cache {
+            return write!(
+                f,
+                "fallback [{}], cached in {} for {}",
+                self.fallback.join(", "),
+                cache.provider,
+                cache.max_age
+            );
+        }
         write!(f, "{}", self.uri)?;
         if !self.credentials.is_empty() {
             let mut names: Vec<&str> = self.credentials.keys().map(String::as_str).collect();
@@ -213,6 +314,13 @@ impl std::fmt::Display for ProviderAlias {
 
 impl Serialize for ProviderAlias {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if let Some(cache) = &self.cache {
+            use serde::ser::SerializeStruct;
+            let mut table = serializer.serialize_struct("ProviderAlias", 2)?;
+            table.serialize_field("fallback", &self.fallback)?;
+            table.serialize_field("cache", cache)?;
+            return table.end();
+        }
         if self.credentials.is_empty() {
             // A bare alias serializes back to the plain-string form, so an alias
             // that was written as a string round-trips unchanged.
@@ -235,7 +343,10 @@ impl<'de> Deserialize<'de> for ProviderAlias {
             type Value = ProviderAlias;
 
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("a provider URI string or a { uri, credentials } table")
+                f.write_str(
+                    "a provider URI string, a { uri, credentials } table, or a \
+                     { fallback, cache } table",
+                )
             }
 
             fn visit_str<E: serde::de::Error>(self, uri: &str) -> Result<ProviderAlias, E> {
@@ -252,15 +363,63 @@ impl<'de> Deserialize<'de> for ProviderAlias {
                 #[derive(Deserialize)]
                 #[serde(deny_unknown_fields)]
                 struct Table {
-                    uri: String,
+                    #[serde(default)]
+                    uri: Option<String>,
                     #[serde(default)]
                     credentials: Option<HashMap<String, CredentialSource>>,
+                    #[serde(default)]
+                    fallback: Option<Vec<String>>,
+                    #[serde(default)]
+                    cache: Option<ProviderCache>,
                 }
                 let table = Table::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
-                Ok(ProviderAlias {
-                    uri: table.uri,
-                    credentials: table.credentials.unwrap_or_default(),
-                })
+                match (table.uri, table.fallback, table.cache) {
+                    (Some(uri), None, None) => Ok(ProviderAlias {
+                        uri,
+                        credentials: table.credentials.unwrap_or_default(),
+                        fallback: Vec::new(),
+                        cache: None,
+                    }),
+                    (None, Some(fallback), Some(cache)) => {
+                        if table.credentials.is_some() {
+                            return Err(serde::de::Error::custom(
+                                "a cached provider alias cannot declare credentials; \
+                                 put credentials on its leaf fallback aliases",
+                            ));
+                        }
+                        if fallback.is_empty() || fallback.iter().any(|spec| spec.trim().is_empty())
+                        {
+                            return Err(serde::de::Error::custom(
+                                "a cached provider alias requires at least one non-empty fallback",
+                            ));
+                        }
+                        if cache.provider.trim().is_empty() {
+                            return Err(serde::de::Error::custom(
+                                "cache.provider must be a non-empty provider spec",
+                            ));
+                        }
+                        parse_cache_max_age(&cache.max_age).map_err(serde::de::Error::custom)?;
+                        Ok(ProviderAlias {
+                            uri: String::new(),
+                            credentials: HashMap::new(),
+                            fallback,
+                            cache: Some(cache),
+                        })
+                    }
+                    (Some(_), Some(_), _) | (Some(_), _, Some(_)) => Err(serde::de::Error::custom(
+                        "a provider alias must use either { uri, credentials } or \
+                             { fallback, cache }, not both",
+                    )),
+                    (None, Some(_), None) => Err(serde::de::Error::custom(
+                        "a cached provider alias with fallback also requires cache",
+                    )),
+                    (None, None, Some(_)) => Err(serde::de::Error::custom(
+                        "a cached provider alias with cache also requires fallback",
+                    )),
+                    (None, None, None) => Err(serde::de::Error::custom(
+                        "a provider alias table requires uri or fallback plus cache",
+                    )),
+                }
             }
         }
 
@@ -3043,6 +3202,7 @@ mod provider_alias_tests {
             let alias = ProviderAlias {
                 uri: "vault://kv".to_string(),
                 credentials: HashMap::from([("role_id".to_string(), source.clone())]),
+                ..Default::default()
             };
             let map = HashMap::from([("vault".to_string(), alias.clone())]);
             let serialized = toml::to_string(&map).unwrap();
@@ -3062,6 +3222,64 @@ mod provider_alias_tests {
         // and serializes back to it.
         let map = parse(r#"keyring = { uri = "keyring://", credentials = {} }"#);
         assert_eq!(map["keyring"], ProviderAlias::from("keyring://"));
+    }
+
+    #[test]
+    fn cached_alias_parses_and_round_trips() {
+        let map = parse(
+            r#"myprovider = { fallback = ["azure", "env"], cache = { provider = "local", max_age = "8h" } }"#,
+        );
+        let alias = &map["myprovider"];
+        assert!(alias.is_cached());
+        assert_eq!(alias.fallback, ["azure", "env"]);
+        assert_eq!(
+            alias.cache.as_ref(),
+            Some(&ProviderCache {
+                provider: "local".to_string(),
+                max_age: "8h".to_string(),
+            })
+        );
+
+        let serialized = toml::to_string(&map).unwrap();
+        assert_eq!(parse(&serialized), map);
+    }
+
+    #[test]
+    fn cache_duration_supports_compound_values() {
+        assert_eq!(parse_cache_max_age("1h30m"), Ok(5_400));
+        assert_eq!(parse_cache_max_age("2d"), Ok(172_800));
+    }
+
+    #[test]
+    fn malformed_cached_aliases_are_rejected_precisely() {
+        for (toml, expected) in [
+            (
+                r#"p = { fallback = [], cache = { provider = "local", max_age = "1h" } }"#,
+                "at least one",
+            ),
+            (
+                r#"p = { fallback = ["source"], cache = { provider = "", max_age = "1h" } }"#,
+                "cache.provider",
+            ),
+            (
+                r#"p = { fallback = ["source"], cache = { provider = "local", max_age = "3600" } }"#,
+                "needs a unit",
+            ),
+            (
+                r#"p = { uri = "env://", fallback = ["source"], cache = { provider = "local", max_age = "1h" } }"#,
+                "either",
+            ),
+            (
+                r#"p = { fallback = ["source"], cache = { provider = "local", max_age = "1h" }, credentials = { token = "env" } }"#,
+                "cannot declare credentials",
+            ),
+        ] {
+            let error = toml::from_str::<HashMap<String, ProviderAlias>>(toml).unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected:?} in {error}"
+            );
+        }
     }
 
     #[test]
@@ -3103,6 +3321,7 @@ mod provider_alias_tests {
                 "access_token".to_string(),
                 CredentialSource::from("keyring"),
             )]),
+            ..Default::default()
         };
         let map = HashMap::from([("bws".to_string(), alias.clone())]);
         let serialized = toml::to_string(&map).unwrap();

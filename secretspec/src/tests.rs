@@ -1,6 +1,6 @@
 use crate::config::{
     Config, CredentialSource, GlobalConfig, GlobalDefaults, NativeAddress, ParseError, Profile,
-    Project, ProviderAlias, RequireReason, Resolved, Secret,
+    Project, ProviderAlias, ProviderCache, RequireReason, Resolved, Secret,
 };
 use crate::error::{Result, SecretSpecError};
 use crate::secrets::Secrets;
@@ -6585,6 +6585,7 @@ fn secrets_with_credential_alias(
         ProviderAlias {
             uri: target_uri.to_string(),
             credentials,
+            ..Default::default()
         },
     )]));
     Secrets::new(config, None, None, None)
@@ -6849,6 +6850,7 @@ fn credential_chain_is_limited_to_one_hop() {
                     "access_token".to_string(),
                     CredentialSource::from("keyring"),
                 )]),
+                ..Default::default()
             },
         ),
         (
@@ -6859,6 +6861,7 @@ fn credential_chain_is_limited_to_one_hop() {
                     "access_token".to_string(),
                     CredentialSource::from("chained"),
                 )]),
+                ..Default::default()
             },
         ),
     ]));
@@ -7023,4 +7026,254 @@ fn store_provider_credential_rejects_a_read_only_source() {
         &secrecy::SecretString::new("x".into()),
     );
     assert!(result.is_err(), "the env provider is read-only");
+}
+
+fn cached_dotenv_secrets(source_paths: &[&Path], cache_path: &Path, max_age: &str) -> Secrets {
+    let mut config = resolve_test_config(HashMap::from([(
+        "API_KEY".to_string(),
+        Secret {
+            providers: Some(vec!["myprovider".to_string()]),
+            ..Default::default()
+        },
+    )]));
+    let mut providers = HashMap::new();
+    let mut fallback = Vec::new();
+    for (index, path) in source_paths.iter().enumerate() {
+        let alias = format!("source{index}");
+        fallback.push(alias.clone());
+        providers.insert(
+            alias,
+            ProviderAlias::from(format!("dotenv://{}", path.display())),
+        );
+    }
+    providers.insert(
+        "local".to_string(),
+        ProviderAlias::from(format!("dotenv://{}", cache_path.display())),
+    );
+    providers.insert(
+        "myprovider".to_string(),
+        ProviderAlias {
+            fallback,
+            cache: Some(ProviderCache {
+                provider: "local".to_string(),
+                max_age: max_age.to_string(),
+            }),
+            ..Default::default()
+        },
+    );
+    config.providers = Some(providers);
+    Secrets::new(config, None, None, None)
+}
+
+fn resolved_value(secrets: &Secrets, name: &str) -> String {
+    secrets.resolve().unwrap().secrets[name]
+        .value
+        .clone()
+        .expect("inline resolved value")
+}
+
+#[test]
+fn cached_route_hits_cache_refreshes_after_clear_and_survives_source_loss() {
+    let _env = scrub_resolution_env();
+    let temp = TempDir::new().unwrap();
+    let source = temp.path().join("source.env");
+    let cache = temp.path().join("cache.env");
+    fs::write(&source, "API_KEY=remote-1\n").unwrap();
+    let secrets = cached_dotenv_secrets(&[&source], &cache, "8h");
+
+    assert_eq!(resolved_value(&secrets, "API_KEY"), "remote-1");
+    assert!(cache.exists(), "the first source hit should populate cache");
+
+    fs::write(&source, "API_KEY=remote-2\n").unwrap();
+    assert_eq!(
+        resolved_value(&secrets, "API_KEY"),
+        "remote-1",
+        "a fresh cache hit wins over the changed source"
+    );
+
+    assert_eq!(secrets.clear_cache(Some("API_KEY")).unwrap(), 1);
+    assert_eq!(resolved_value(&secrets, "API_KEY"), "remote-2");
+
+    fs::remove_file(&source).unwrap();
+    fs::create_dir(&source).unwrap();
+    assert_eq!(
+        resolved_value(&secrets, "API_KEY"),
+        "remote-2",
+        "a fresh hit must not contact the now-broken authoritative provider"
+    );
+}
+
+#[test]
+fn cached_route_walks_fallback_in_order_and_caches_the_answer() {
+    let _env = scrub_resolution_env();
+    let temp = TempDir::new().unwrap();
+    let missing = temp.path().join("missing.env");
+    let fallback = temp.path().join("fallback.env");
+    let cache = temp.path().join("cache.env");
+    fs::write(&fallback, "API_KEY=from-fallback\n").unwrap();
+    let secrets = cached_dotenv_secrets(&[&missing, &fallback], &cache, "1h");
+
+    assert_eq!(resolved_value(&secrets, "API_KEY"), "from-fallback");
+    fs::remove_file(&fallback).unwrap();
+    assert_eq!(resolved_value(&secrets, "API_KEY"), "from-fallback");
+}
+
+#[test]
+fn expired_cache_entry_falls_back_and_refreshes() {
+    let _env = scrub_resolution_env();
+    let temp = TempDir::new().unwrap();
+    let source = temp.path().join("source.env");
+    let cache = temp.path().join("cache.env");
+    fs::write(&source, "API_KEY=remote-1\n").unwrap();
+    let secrets = cached_dotenv_secrets(&[&source], &cache, "8h");
+    assert_eq!(resolved_value(&secrets, "API_KEY"), "remote-1");
+
+    let (_, cached_json) = dotenvy::from_path_iter(&cache)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    let mut envelope: serde_json::Value = serde_json::from_str(&cached_json).unwrap();
+    envelope["cached_at"] = serde_json::json!(0);
+    let cache_uri = format!("dotenv://{}", cache.display());
+    let cache_provider = crate::provider::provider_from_spec(
+        &cache_uri,
+        crate::provider::ProviderCredentials::new(),
+    )
+    .unwrap();
+    cache_provider
+        .set(
+            crate::provider::Address::convention("resolve-test", "default", "API_KEY"),
+            &secrecy::SecretString::new(serde_json::to_string(&envelope).unwrap().into()),
+        )
+        .unwrap();
+
+    fs::write(&source, "API_KEY=remote-2\n").unwrap();
+    assert_eq!(resolved_value(&secrets, "API_KEY"), "remote-2");
+}
+
+#[test]
+fn value_free_report_does_not_populate_cache() {
+    let _env = scrub_resolution_env();
+    let temp = TempDir::new().unwrap();
+    let source = temp.path().join("source.env");
+    let cache = temp.path().join("cache.env");
+    fs::write(&source, "API_KEY=remote\n").unwrap();
+    let secrets = cached_dotenv_secrets(&[&source], &cache, "1h");
+
+    let report = secrets.report().unwrap();
+    assert!(report.all_required_present());
+    assert!(
+        !cache.exists(),
+        "value-free resolution must not create a cache entry"
+    );
+}
+
+#[test]
+fn set_writes_authoritative_provider_then_refreshes_cache() {
+    let _env = scrub_resolution_env();
+    let temp = TempDir::new().unwrap();
+    let source = temp.path().join("source.env");
+    let cache = temp.path().join("cache.env");
+    let secrets = cached_dotenv_secrets(&[&source], &cache, "1h");
+
+    secrets.set("API_KEY", Some("written".to_string())).unwrap();
+    let source_value = dotenvy::from_path_iter(&source)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    assert_eq!(source_value, ("API_KEY".to_string(), "written".to_string()));
+    fs::remove_file(&source).unwrap();
+    assert_eq!(resolved_value(&secrets, "API_KEY"), "written");
+}
+
+#[test]
+fn malformed_cache_entry_is_ignored_and_refreshed() {
+    let _env = scrub_resolution_env();
+    let temp = TempDir::new().unwrap();
+    let source = temp.path().join("source.env");
+    let cache = temp.path().join("cache.env");
+    fs::write(&source, "API_KEY=remote-1\n").unwrap();
+    let secrets = cached_dotenv_secrets(&[&source], &cache, "1h");
+    assert_eq!(resolved_value(&secrets, "API_KEY"), "remote-1");
+
+    let cache_uri = format!("dotenv://{}", cache.display());
+    let cache_provider = crate::provider::provider_from_spec(
+        &cache_uri,
+        crate::provider::ProviderCredentials::new(),
+    )
+    .unwrap();
+    cache_provider
+        .set(
+            crate::provider::Address::convention("resolve-test", "default", "API_KEY"),
+            &secrecy::SecretString::new("not-json".into()),
+        )
+        .unwrap();
+    fs::write(&source, "API_KEY=remote-2\n").unwrap();
+
+    assert_eq!(resolved_value(&secrets, "API_KEY"), "remote-2");
+    let (_, refreshed) = dotenvy::from_path_iter(&cache)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    assert!(serde_json::from_str::<serde_json::Value>(&refreshed).is_ok());
+}
+
+#[test]
+fn changed_authoritative_route_invalidates_existing_cache() {
+    let _env = scrub_resolution_env();
+    let temp = TempDir::new().unwrap();
+    let source_a = temp.path().join("source-a.env");
+    let source_b = temp.path().join("source-b.env");
+    let cache = temp.path().join("cache.env");
+    fs::write(&source_a, "API_KEY=from-a\n").unwrap();
+    fs::write(&source_b, "API_KEY=from-b\n").unwrap();
+
+    let first = cached_dotenv_secrets(&[&source_a], &cache, "1h");
+    assert_eq!(resolved_value(&first, "API_KEY"), "from-a");
+
+    let changed = cached_dotenv_secrets(&[&source_b], &cache, "1h");
+    assert_eq!(
+        resolved_value(&changed, "API_KEY"),
+        "from-b",
+        "the cache must not survive a change to its authoritative provider route"
+    );
+}
+
+#[test]
+fn cache_write_failure_does_not_hide_authoritative_value() {
+    let _env = scrub_resolution_env();
+    let temp = TempDir::new().unwrap();
+    let source = temp.path().join("source.env");
+    fs::write(&source, "API_KEY=remote\n").unwrap();
+    let mut config = resolve_test_config(HashMap::from([(
+        "API_KEY".to_string(),
+        Secret {
+            providers: Some(vec!["myprovider".to_string()]),
+            ..Default::default()
+        },
+    )]));
+    config.providers = Some(HashMap::from([
+        (
+            "source".to_string(),
+            ProviderAlias::from(format!("dotenv://{}", source.display())),
+        ),
+        ("readonly".to_string(), ProviderAlias::from("env://")),
+        (
+            "myprovider".to_string(),
+            ProviderAlias {
+                fallback: vec!["source".to_string()],
+                cache: Some(ProviderCache {
+                    provider: "readonly".to_string(),
+                    max_age: "1h".to_string(),
+                }),
+                ..Default::default()
+            },
+        ),
+    ]));
+    let secrets = Secrets::new(config, None, None, None);
+
+    assert_eq!(resolved_value(&secrets, "API_KEY"), "remote");
 }

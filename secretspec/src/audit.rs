@@ -53,6 +53,8 @@ pub(crate) enum AuditAction {
     Import,
     /// Resolve all secrets and emit them for another tool (`secretspec export`)
     Export,
+    /// Delete one or more cached secret values (`secretspec cache clear`).
+    CacheClear,
 }
 
 /// The result of an audited operation.
@@ -67,6 +69,8 @@ pub(crate) enum AuditOutcome {
     Default,
     /// The secret was written successfully.
     Written,
+    /// A cached secret was deleted successfully.
+    Deleted,
     /// The audited subprocess (`run`) was successfully started with the secrets
     /// injected. Distinct from `found`, which is about a secret lookup.
     Started,
