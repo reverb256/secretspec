@@ -69,5 +69,6 @@ openbao = ["dep:reqwest"]
 # name the features it uses rather than inherit them from a sibling.
 infisical = ["dep:reqwest", "tokio/sync"]
 bws = []
+sops = ["tokio/process", "tokio/io-util", "tokio/time", "tokio/macros", "tokio/sync"]
 akv = ["dep:azure_core", "dep:azure_identity", "dep:azure_security_keyvault_secrets"]
 age = ["dep:age"]

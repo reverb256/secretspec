@@ -271,7 +271,8 @@ pub mod age;
 pub mod akv;
 #[cfg(feature = "awssm")]
 pub mod awssm;
-#[cfg(feature = "bws")]
+#[cfg(feature = "sops")]
+pub mod sops;
 pub mod bws;
 pub mod dotenv;
 pub mod env;
